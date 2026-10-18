@@ -56,6 +56,14 @@ MAX_DEPTH = 30
 BACK_KEY_APPS = {"Firefox"}
 # AT-SPI name of Phosh's top bar, whose drawer holds the quick settings.
 TOP_PANEL = "phosh panel"
+# Display transform (Mutter DisplayConfig) that keeps the picture upright for
+# each accelerometer orientation (iio-sensor-proxy), checked on a OnePlus 6.
+ORIENTATION_TRANSFORMS = {"normal": 0, "left-up": 1, "bottom-up": 2,
+                          "right-up": 3}
+ROTATE_OFFER_SECONDS = 4
+# Stevia shows itself again when the screen rotates; how long after a
+# rotation the panel undoes that.
+OSK_RESHOW_SECONDS = 2
 
 # wtype arguments per action: -M/-m press/release a modifier, -k taps a key.
 KEYS = {
@@ -68,6 +76,10 @@ KEYS = {
     "undo": ["-M", "ctrl", "-k", "z", "-m", "ctrl"],
     "redo": ["-M", "ctrl", "-M", "shift", "-k", "z", "-m", "shift", "-m", "ctrl"],
     "select-all": ["-M", "ctrl", "-k", "a", "-m", "ctrl"],
+    # Right first, so a caret at the start of a word moves into it; then
+    # back to the word's start and select to its end.
+    "select-word": ["-k", "Right", "-M", "ctrl", "-k", "Left",
+                    "-M", "shift", "-k", "Right", "-m", "shift", "-m", "ctrl"],
 }
 
 QUICK_ACTIONS = [
@@ -76,6 +88,7 @@ QUICK_ACTIONS = [
     ("edit-cut-symbolic", "cut"),
     ("edit-copy-symbolic", "copy"),
     ("edit-paste-symbolic", "paste"),
+    ("edit-select-symbolic", "select-word"),
     ("edit-select-all-symbolic", "select-all"),
 ]
 
@@ -86,6 +99,11 @@ window.og-home-panel { background: transparent; }
 button.nav { min-height: 40px; min-width: 40px; padding: 5px; border-radius: 20px;
              background: none; color: #eee; border: none; box-shadow: none; }
 button.nav:active, button.nav:checked { background: #3a3a3a; }
+button.nav.floating { background: rgba(28, 28, 28, 0.85); border-radius: 25px; }
+button.nav.floating:active { background: #3a3a3a; }
+button.nav.turn-1 { -gtk-icon-transform: rotate(-90deg); }
+button.nav.turn-2 { -gtk-icon-transform: rotate(180deg); }
+button.nav.turn-3 { -gtk-icon-transform: rotate(90deg); }
 """
 
 
@@ -542,6 +560,83 @@ class FullscreenWatcher:
             self.report(fullscreen)
 
 
+class RotationWatcher:
+    """Offer to rotate the screen when the phone is turned while rotation
+    is locked, like Android's rotate button.
+
+    Calls offer(transform) when the phone's orientation stops matching the
+    screen's, and offer(None) when it matches again.
+    """
+    SENSOR = ("net.hadess.SensorProxy", "/net/hadess/SensorProxy",
+              "net.hadess.SensorProxy")
+    DISPLAY = ("org.gnome.Mutter.DisplayConfig",
+               "/org/gnome/Mutter/DisplayConfig",
+               "org.gnome.Mutter.DisplayConfig")
+    LOCK_SCHEMA = "org.gnome.settings-daemon.peripherals.touchscreen"
+
+    def __init__(self, offer):
+        self.offer = offer
+        self.claimed = False
+        self.current = 0  # The display's transform when last checked
+        self.system_bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+        self.session_bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        source = Gio.SettingsSchemaSource.get_default()
+        self.settings = (Gio.Settings.new(self.LOCK_SCHEMA) if source
+                         and source.lookup(self.LOCK_SCHEMA, True) else None)
+        self.system_bus.signal_subscribe(
+            self.SENSOR[0], "org.freedesktop.DBus.Properties",
+            "PropertiesChanged", self.SENSOR[1], self.SENSOR[2],
+            Gio.DBusSignalFlags.NONE, self.on_sensor)
+
+    def set_active(self, active):
+        """Claim the accelerometer only while needed; it costs power."""
+        if active == self.claimed:
+            return
+        try:
+            self.system_bus.call_sync(
+                *self.SENSOR, "ClaimAccelerometer" if active
+                else "ReleaseAccelerometer", None, None,
+                Gio.DBusCallFlags.NONE, -1, None)
+            self.claimed = active
+        except GLib.Error as error:
+            print("rotation:", error.message, flush=True)
+
+    def on_sensor(self, *args):
+        orientation = args[5].unpack()[1].get("AccelerometerOrientation")
+        transform = ORIENTATION_TRANSFORMS.get(orientation)
+        if transform is None:  # Unchanged, or "undefined" (lying flat)
+            return
+        locked = self.settings and self.settings.get_boolean(
+            "orientation-lock")
+        try:
+            self.current = self.display_state()[2][0][3]
+        except (GLib.Error, IndexError):
+            return
+        self.offer(transform if locked and transform != self.current
+                   else None)
+
+    def display_state(self):
+        return self.session_bus.call_sync(
+            *self.DISPLAY, "GetCurrentState", None, None,
+            Gio.DBusCallFlags.NONE, -1, None).unpack()
+
+    def rotate(self, transform):
+        """Apply the current monitor setup with a new transform."""
+        serial, monitors, logical, _props = self.display_state()
+        modes = {monitor[0][0]: next(mode[0] for mode in monitor[1]
+                                     if mode[6].get("is-current"))
+                 for monitor in monitors}
+        config = [(x, y, scale, transform, primary,
+                   [(c[0], modes[c[0]], {}) for c in connectors])
+                  for x, y, scale, _old, primary, connectors, _p in logical]
+        # Method 2 (persistent): Phosh ignores 1 (temporary).
+        self.session_bus.call_sync(
+            *self.DISPLAY, "ApplyMonitorsConfig",
+            GLib.Variant("(uua(iiduba(ssa{sv}))a{sv})",
+                         (serial, 2, config, {})),
+            None, Gio.DBusCallFlags.NONE, -1, None)
+
+
 def init_layer_surface(window):
     """Make window a layer surface along the bottom edge of the screen."""
     window.add_css_class("og-home-panel")
@@ -565,6 +660,19 @@ class HomePanel(Gtk.ApplicationWindow):
         self.more = nav_button("view-more-symbolic",
                                lambda _b: self.update_visibility(),
                                toggle=True)
+        # The rotate offer briefly takes the ⋯ button's place.
+        self.rotate = nav_button("rotation-allowed-symbolic", self.on_rotate)
+        self.more_slot = Gtk.Stack(
+            transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.more_slot.add_child(self.more)
+        self.more_slot.add_child(self.rotate)
+        self.offered = None
+        self.offer_timeout = 0
+        self.osk_hidden_until = 0
+        Gio.bus_get_sync(Gio.BusType.SESSION).signal_subscribe(
+            "sm.puri.OSK0", "org.freedesktop.DBus.Properties",
+            "PropertiesChanged", "/sm/puri/OSK0", "sm.puri.OSK0",
+            Gio.DBusSignalFlags.NONE, self.on_osk_changed)
         self.bar = button_row("bar", [
             nav_button("go-previous-symbolic", self.on_back,
                        lambda: send_keys("escape")),
@@ -572,7 +680,7 @@ class HomePanel(Gtk.ApplicationWindow):
                        lambda _b: send_keys("app-view")),
             nav_button("input-keyboard-symbolic",
                        lambda _b: set_osk_visible(not osk_visible())),
-            self.more,
+            self.more_slot,
         ], spread=True, height_request=BAR_HEIGHT)
         self.set_child(self.bar)
         self.connect("map", self.on_map)
@@ -590,6 +698,18 @@ class HomePanel(Gtk.ApplicationWindow):
             nav_button(icon, lambda _b, a=action: send_keys(a))
             for icon, action in QUICK_ACTIONS]))
 
+        # In fullscreen the bar is hidden, so the rotate offer floats on its
+        # own where ⋯ would be, without resizing the app.
+        self.rotate_float = Gtk.Window(application=app)
+        init_layer_surface(self.rotate_float)
+        LayerShell.set_anchor(self.rotate_float, LayerShell.Edge.LEFT, False)
+        LayerShell.set_exclusive_zone(self.rotate_float, -1)
+        self.floating = nav_button("rotation-allowed-symbolic",
+                                   self.on_rotate)
+        self.floating.add_css_class("floating")
+        self.rotate_float.set_child(self.floating)
+
+        self.rotation = RotationWatcher(self.offer_rotation)
         # The lock screen is also on the overlay layer; keep off it.
         self.hidden_by = set()
         self.system_bus = watch_locked(
@@ -617,14 +737,74 @@ class HomePanel(Gtk.ApplicationWindow):
             self.hidden_by.add(reason)
         else:
             self.hidden_by.discard(reason)
+        if reason == "locked":
+            self.rotation.set_active(not hidden)
         self.update_visibility()
 
     def update_visibility(self):
         self.set_visible(not self.hidden_by)
         self.actions.set_visible(not self.hidden_by and self.more.get_active())
+        self.rotate_float.set_visible(self.offered is not None
+                                      and self.hidden_by == {"fullscreen"})
 
     def on_back(self, _button):
         self.atspi.send(f"back {time.monotonic()}")
+
+    def offer_rotation(self, transform):
+        """Show the rotate button for a few seconds, or None to take it
+        away."""
+        if self.offer_timeout:
+            GLib.source_remove(self.offer_timeout)
+            self.offer_timeout = 0
+        self.offered = transform
+        self.more_slot.set_visible_child(
+            self.more if transform is None else self.rotate)
+        if transform is not None:
+            self.place_floating((transform - self.rotation.current) % 4)
+            self.offer_timeout = GLib.timeout_add_seconds(
+                ROTATE_OFFER_SECONDS, self.end_offer)
+        self.update_visibility()
+
+    def place_floating(self, turns):
+        """Put the floating rotate button in the bottom-right corner of the
+        rotated view; turns is how far the phone is turned, in clockwise
+        quarter turns."""
+        edges = [LayerShell.Edge.TOP, LayerShell.Edge.RIGHT,
+                 LayerShell.Edge.BOTTOM, LayerShell.Edge.LEFT]
+        corner = {edges[(2 - turns) % 4], edges[(1 - turns) % 4]}
+        for edge in edges:
+            LayerShell.set_anchor(self.rotate_float, edge, edge in corner)
+        # Turn the icon upright too.
+        for turn in range(1, 4):
+            self.floating.remove_css_class(f"turn-{turn}")
+        if turns:
+            self.floating.add_css_class(f"turn-{turns}")
+
+    def end_offer(self):
+        self.offer_timeout = 0
+        self.offer_rotation(None)
+        return GLib.SOURCE_REMOVE
+
+    def on_rotate(self, _button):
+        transform = self.offered
+        self.offer_rotation(None)
+        if transform is None:
+            return
+        print("rotate to transform", transform, flush=True)
+        try:
+            if not osk_visible():
+                self.osk_hidden_until = time.monotonic() + OSK_RESHOW_SECONDS
+            self.rotation.rotate(transform)
+        except GLib.Error as error:
+            print("rotate failed:", error.message, flush=True)
+
+    def on_osk_changed(self, *args):
+        # Stevia rebuilds itself for the new screen size and comes back
+        # visible; keep it closed if it was closed before the rotation.
+        if (args[5].unpack()[1].get("Visible")
+                and time.monotonic() < self.osk_hidden_until):
+            self.osk_hidden_until = 0
+            set_osk_visible(False)
 
 
 def main():

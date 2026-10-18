@@ -15,7 +15,8 @@ Status: early development. It runs on Phosh. Plasma Mobile, wlroots shells (Sway
 | Back | Presses the app's own Back button. If there is none, the app goes to the background and the overview opens | Escape |
 | Apps | Opens the app overview | (planned: running apps) |
 | Keyboard | Shows or hides the on-screen keyboard | |
-| ⋯ | Shows a row of quick actions: undo, redo, cut, copy, paste, select all | |
+| ⋯ | Shows a row of quick actions: undo, redo, cut, copy, paste, select word, select all | |
+| Rotate | Appears in place of ⋯ for 4 seconds when you turn the phone while screen rotation is locked. Tap it to rotate the screen to match. In fullscreen, where the bar is hidden, it floats on its own in the bottom-right corner, as you're holding the phone | |
 
 Every button gives a short haptic tick (via feedbackd) as you touch it.
 
