@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Desktop Entry]
+Type=Application
+Name=og-home-panel
+Comment=Back, apps and quick-action buttons at the bottom of the screen
+Exec=og-home-panel
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

@@ -1,0 +1,652 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright 2026 AntzCode
+"""og-home-panel: back, app/overview and quick-action buttons for Linux phones.
+
+A bottom-anchored layer-shell surface that sits above the Phosh home bar.
+Key events are injected into the focused app with wtype (virtual keyboard).
+Back works like Android: it presses the app's own Back button found through
+the accessibility tree (AT-SPI), and sends the app to the background when
+there is none to press.
+
+gtk4-layer-shell must be loaded before libwayland, so the script re-executes
+itself with the library preloaded.
+
+AT-SPI runs in a helper process (the same script, run with --atspi-helper).
+"""
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+HELPER_FLAG = "--atspi-helper"
+LAYER_SHELL_LIB = "/usr/lib/libgtk4-layer-shell.so.0"
+if (HELPER_FLAG not in sys.argv
+        and LAYER_SHELL_LIB not in os.environ.get("LD_PRELOAD", "")):
+    os.environ["LD_PRELOAD"] = " ".join(
+        filter(None, [LAYER_SHELL_LIB, os.environ.get("LD_PRELOAD")]))
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+import gi
+
+gi.require_version("Atspi", "2.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+gi.require_version("Lfb", "0.0")
+from gi.repository import Atspi, Gdk, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
+from gi.repository import Lfb  # noqa: E402
+
+APP_ID = "com.antzcode.og_home_panel"
+BAR_HEIGHT = 44
+
+BACK_NAME = re.compile(r"^(go )?back\b", re.IGNORECASE)
+# Subtrees that never hold an app's Back button; skipping web page content
+# keeps the search fast in browsers.
+SKIP_ROLES = {Atspi.Role.DOCUMENT_WEB, Atspi.Role.DOCUMENT_FRAME,
+              Atspi.Role.TERMINAL, Atspi.Role.TEXT}
+DIALOG_ROLES = {Atspi.Role.DIALOG, Atspi.Role.ALERT, Atspi.Role.FILE_CHOOSER}
+MAX_DEPTH = 30
+# Apps where Alt+Left does what their Back button does. Pressing the button
+# through AT-SPI is slow in these (~0.8 s in Firefox), a key press is not.
+BACK_KEY_APPS = {"Firefox"}
+# AT-SPI name of Phosh's top bar, whose drawer holds the quick settings.
+TOP_PANEL = "phosh panel"
+
+# wtype arguments per action: -M/-m press/release a modifier, -k taps a key.
+KEYS = {
+    "back": ["-M", "alt", "-k", "Left", "-m", "alt"],
+    "escape": ["-k", "Escape"],
+    "app-view": ["-M", "logo", "-k", "a", "-m", "logo"],
+    "copy": ["-M", "ctrl", "-k", "c", "-m", "ctrl"],
+    "cut": ["-M", "ctrl", "-k", "x", "-m", "ctrl"],
+    "paste": ["-M", "ctrl", "-k", "v", "-m", "ctrl"],
+    "undo": ["-M", "ctrl", "-k", "z", "-m", "ctrl"],
+    "redo": ["-M", "ctrl", "-M", "shift", "-k", "z", "-m", "shift", "-m", "ctrl"],
+    "select-all": ["-M", "ctrl", "-k", "a", "-m", "ctrl"],
+}
+
+QUICK_ACTIONS = [
+    ("edit-undo-symbolic", "undo"),
+    ("edit-redo-symbolic", "redo"),
+    ("edit-cut-symbolic", "cut"),
+    ("edit-copy-symbolic", "copy"),
+    ("edit-paste-symbolic", "paste"),
+    ("edit-select-all-symbolic", "select-all"),
+]
+
+CSS = b"""
+window.og-home-panel { background: transparent; }
+.bar, .actions { background: #1c1c1c; }
+.actions { border-top: 1px solid #333; }
+button.nav { min-height: 40px; min-width: 40px; padding: 5px; border-radius: 20px;
+             background: none; color: #eee; border: none; box-shadow: none; }
+button.nav:active, button.nav:checked { background: #3a3a3a; }
+"""
+
+
+def send_keys(action):
+    subprocess.Popen(["wtype", *KEYS[action]])
+
+
+def active_window():
+    """Return (app name, window) for the focused window, or (None, None)."""
+    desktop = Atspi.get_desktop(0)
+    for i in range(desktop.get_child_count()):
+        app = desktop.get_child_at_index(i)
+        for j in range(app.get_child_count() if app else 0):
+            window = app.get_child_at_index(j)
+            if window and window.get_state_set().contains(
+                    Atspi.StateType.ACTIVE):
+                return app.get_name(), window
+    return None, None
+
+
+def find_back_button(node, depth=0):
+    """Depth-first search for a button named Back; returns it or None."""
+    if depth > MAX_DEPTH:
+        return None
+    try:
+        role = node.get_role()
+        if role in SKIP_ROLES:
+            return None
+        if (role in (Atspi.Role.PUSH_BUTTON, Atspi.Role.TOGGLE_BUTTON)
+                and BACK_NAME.match(node.get_name() or "")):
+            return node
+        for i in range(node.get_child_count()):
+            child = node.get_child_at_index(i)
+            found = child and find_back_button(child, depth + 1)
+            if found:
+                return found
+    except GLib.Error:
+        # Widgets can disappear while the tree is being walked.
+        pass
+    return None
+
+
+def is_usable(button):
+    states = button.get_state_set()
+    return (states.contains(Atspi.StateType.SENSITIVE)
+            and states.contains(Atspi.StateType.SHOWING))
+
+
+def go_back(t_tap):
+    """Press the app's Back button, close a dialog, or background the app."""
+    try:
+        t_start = time.monotonic()
+        app_name, window = active_window()
+        t_window = time.monotonic()
+        if window is None:
+            return
+        if app_name == "phosh":
+            # Phosh's overview is open; close it.
+            send_keys("app-view")
+        elif window.get_role() in DIALOG_ROLES:
+            send_keys("escape")
+        else:
+            button = find_back_button(window)
+            print(f"back: wait {t_start - t_tap:.3f}s, "
+                  f"window {t_window - t_start:.3f}s, "
+                  f"search {time.monotonic() - t_window:.3f}s",
+                  flush=True)
+            if not (button and is_usable(button)):
+                send_keys("app-view")
+            elif app_name in BACK_KEY_APPS:
+                send_keys("back")
+            else:
+                t_action = time.monotonic()
+                button.get_action_iface().do_action(0)
+                print(f"back: action {time.monotonic() - t_action:.3f}s",
+                      flush=True)
+    except GLib.Error as error:
+        print("back failed:", error.message, flush=True)
+
+
+def find_role(node, role, depth=0):
+    """Depth-first search for a descendant with the given role."""
+    if depth > MAX_DEPTH:
+        return None
+    for i in range(node.get_child_count()):
+        child = node.get_child_at_index(i)
+        if not child:
+            continue
+        if child.get_role() == role:
+            return child
+        found = find_role(child, role, depth + 1)
+        if found:
+            return found
+    return None
+
+
+def toplevel_name(node):
+    while node and node.get_role() != Atspi.Role.FRAME:
+        node = node.get_parent()
+    return node and node.get_name()
+
+
+def find_app(name):
+    desktop = Atspi.get_desktop(0)
+    for i in range(desktop.get_child_count()):
+        app = desktop.get_child_at_index(i)
+        if app and app.get_name() == name:
+            return app
+    return None
+
+
+class DrawerWatcher:
+    """Report whether Phosh's top drawer (quick settings) is open.
+
+    Phosh doesn't publish the drawer state. While the drawer is open, its
+    bottom strip shows a drag handle (a drawing area) instead of the status
+    bar, so follow that handle's showing state. Listen to Phosh only: events
+    registered for all apps would make every app send them. Re-attaches when
+    Phosh restarts.
+    """
+    EVENT = "object:state-changed:showing"
+    ATTACH_TRIES = 30
+
+    def __init__(self, report):
+        self.report = report
+        self.state = None
+        self.phosh = None
+        self.listener = Atspi.EventListener.new(self.on_event)
+        Gio.bus_watch_name(Gio.BusType.SESSION, "org.gnome.Shell",
+                           Gio.BusNameWatcherFlags.NONE,
+                           self.on_shell, self.on_shell_gone)
+
+    def on_shell(self, *_args):
+        # Phosh can be on the session bus before it is on AT-SPI.
+        self.tries = 0
+        if self.attach():
+            GLib.timeout_add_seconds(2, self.attach)
+
+    def attach(self):
+        """Start listening to Phosh; returns True to be retried."""
+        phosh = find_app("phosh")
+        if phosh is None:
+            self.tries += 1
+            if self.tries == self.ATTACH_TRIES:
+                print("drawer: phosh not found on AT-SPI", flush=True)
+            return self.tries < self.ATTACH_TRIES
+        self.phosh = phosh
+        self.listener.register_with_app(self.EVENT, None, phosh)
+        panel = next((w for w in (phosh.get_child_at_index(i)
+                                  for i in range(phosh.get_child_count()))
+                      if w and w.get_name() == TOP_PANEL), None)
+        handle = panel and find_role(panel, Atspi.Role.DRAWING_AREA)
+        self.set(bool(handle) and handle.get_state_set().contains(
+            Atspi.StateType.SHOWING))
+        return False
+
+    def on_shell_gone(self, *_args):
+        if self.phosh:
+            self.listener.deregister(self.EVENT)
+            self.phosh = None
+        self.set(False)
+
+    def on_event(self, event):
+        try:
+            if (event.source.get_role() == Atspi.Role.DRAWING_AREA
+                    and toplevel_name(event.source) == TOP_PANEL):
+                self.set(bool(event.detail1))
+        except GLib.Error:
+            pass
+
+    def set(self, drawer_open):
+        if drawer_open != self.state:
+            self.state = drawer_open
+            self.report(drawer_open)
+
+
+def read_lines(fd, on_line, on_eof):
+    """Call on_line(text) for each line read from fd, on_eof() at its end."""
+    pending = b""
+
+    def readable(*_args):
+        nonlocal pending
+        data = os.read(fd, 4096)
+        if not data:
+            on_eof()
+            return GLib.SOURCE_REMOVE
+        *lines, pending = (pending + data).split(b"\n")
+        for line in lines:
+            on_line(line.decode())
+        return GLib.SOURCE_CONTINUE
+
+    GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT,
+                      GLib.IOCondition.IN | GLib.IOCondition.HUP, readable)
+
+
+def helper_main():
+    """Run AT-SPI work for the panel: Back, and watching Phosh's drawer.
+
+    libatspi attaches the connections it opens later to the default main
+    context, so it can't share a process with GTK's main loop. Commands come
+    on stdin ("back <tap time>"), events go out on stdout ("drawer 0|1").
+    """
+    # Keep stdout for events only; logs, and wtype's output, go to stderr.
+    events = os.fdopen(os.dup(1), "w", buffering=1)
+    os.dup2(2, 1)
+    loop = GLib.MainLoop()
+
+    def command(line):
+        name, *args = line.split() or [""]
+        if name == "back":
+            go_back(float(args[0]))
+
+    read_lines(0, command, loop.quit)
+    DrawerWatcher(lambda drawer_open: events.write(
+        f"drawer {int(drawer_open)}\n"))
+    loop.run()
+
+
+class AtspiHelper:
+    """The helper process, seen from the panel. Restarts it if it exits."""
+
+    def __init__(self, on_drawer):
+        self.on_drawer = on_drawer
+        self.start()
+
+    def start(self):
+        env = dict(os.environ)
+        env["LD_PRELOAD"] = " ".join(
+            lib for lib in env.get("LD_PRELOAD", "").split()
+            if lib != LAYER_SHELL_LIB)
+        self.process = subprocess.Popen(
+            [sys.executable, os.path.realpath(__file__), HELPER_FLAG],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0, env=env)
+        read_lines(self.process.stdout.fileno(), self.on_line, self.on_exit)
+        return GLib.SOURCE_REMOVE
+
+    def on_line(self, line):
+        name, *args = line.split() or [""]
+        if name == "drawer":
+            self.on_drawer(args[0] == "1")
+
+    def on_exit(self):
+        print("atspi helper exited with", self.process.wait(), flush=True)
+        self.process.stdout.close()
+        self.process.stdin.close()
+        self.on_drawer(False)
+        GLib.timeout_add_seconds(2, self.start)
+
+    def send(self, line):
+        try:
+            self.process.stdin.write(f"{line}\n".encode())
+        except (BrokenPipeError, ValueError):
+            pass  # Restarting; the command is dropped.
+
+
+def set_osk_visible(visible):
+    Gio.bus_get_sync(Gio.BusType.SESSION).call_sync(
+        "sm.puri.OSK0", "/sm/puri/OSK0", "sm.puri.OSK0", "SetVisible",
+        GLib.Variant("(b)", (visible,)), None, Gio.DBusCallFlags.NONE, -1)
+
+
+def osk_visible():
+    reply = Gio.bus_get_sync(Gio.BusType.SESSION).call_sync(
+        "sm.puri.OSK0", "/sm/puri/OSK0", "org.freedesktop.DBus.Properties",
+        "Get", GLib.Variant("(ss)", ("sm.puri.OSK0", "Visible")),
+        None, Gio.DBusCallFlags.NONE, -1)
+    return reply.unpack()[0]
+
+
+def haptic(*_args):
+    Lfb.Event.new("button-pressed").trigger_feedback_async(None, None)
+
+
+def button_row(css_class, buttons, spread=False, **props):
+    """A row of buttons, packed from the left or with the free width spread
+    between them."""
+    row = Gtk.Box(css_classes=[css_class], **props)
+    for i, button in enumerate(buttons):
+        if i and spread:
+            row.append(Gtk.Box(hexpand=True))
+        row.append(button)
+    return row
+
+
+def nav_button(icon, on_tap, on_long_press=None, toggle=False):
+    button = (Gtk.ToggleButton if toggle else Gtk.Button)(icon_name=icon)
+    button.add_css_class("nav")
+    # Feedback on touch down, so a tap is felt before its action completes.
+    touch = Gtk.GestureClick()
+    touch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    touch.connect("pressed", haptic)
+    button.add_controller(touch)
+    button.connect("toggled" if toggle else "clicked", on_tap)
+    if on_long_press:
+        press = Gtk.GestureLongPress()
+        press.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+
+        def pressed(gesture, _x, _y):
+            # Claiming the sequence cancels the button's own click.
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            on_long_press()
+
+        press.connect("pressed", pressed)
+        button.add_controller(press)
+    return button
+
+
+LOGIN1 = "org.freedesktop.login1"
+
+
+def login1_get(bus, path, interface, prop):
+    reply = bus.call_sync(
+        LOGIN1, path, "org.freedesktop.DBus.Properties", "Get",
+        GLib.Variant("(ss)", (interface, prop)), GLib.VariantType("(v)"),
+        Gio.DBusCallFlags.NONE, -1, None)
+    return reply.unpack()[0]
+
+
+def watch_locked(callback):
+    """Call callback(locked) now and whenever the session is (un)locked.
+
+    Phosh's org.gnome.ScreenSaver "active" follows screen blanking, not the
+    lock screen, so use logind's LockedHint, which Phosh sets on lock.
+    Returns the system bus connection; keep it, or the subscription dies
+    with it (GIO holds the shared connection only weakly).
+    """
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+    _id, session = login1_get(bus, "/org/freedesktop/login1/user/self",
+                              "org.freedesktop.login1.User", "Display")
+
+    def changed(*args):
+        props = args[5].unpack()[1]
+        if "LockedHint" in props:
+            callback(props["LockedHint"])
+
+    bus.signal_subscribe(
+        LOGIN1, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+        session, "org.freedesktop.login1.Session", Gio.DBusSignalFlags.NONE,
+        changed)
+    callback(login1_get(bus, session, "org.freedesktop.login1.Session",
+                        "LockedHint"))
+    return bus
+
+
+class FullscreenWatcher:
+    """Report whether the focused window is fullscreen.
+
+    A minimal Wayland client for wlr-foreign-toplevel-management, which phoc
+    implements. GTK doesn't expose the protocol and pywayland lacks the wlr
+    protocols, so this speaks the few messages it needs over its own socket.
+    """
+    MANAGER = "zwlr_foreign_toplevel_manager_v1"
+    ACTIVATED, FULLSCREEN = 2, 3  # zwlr_foreign_toplevel_handle_v1.state
+    HANDLE_DESTROY = 7
+
+    def __init__(self, report):
+        self.report = report
+        self.fullscreen = False
+        self.objects = {1: self.on_display}
+        self.next_id = 2
+        self.handles = {}  # id -> [current states, pending states]
+        self.buffer = b""
+        display = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(os.path.join(
+            os.environ.get("XDG_RUNTIME_DIR", ""), display))
+        registry = self.new_object(self.on_registry)
+        self.send(1, 1, struct.pack("=I", registry))  # wl_display.get_registry
+        GLib.io_add_watch(self.sock.fileno(), GLib.PRIORITY_DEFAULT,
+                          GLib.IOCondition.IN | GLib.IOCondition.HUP,
+                          self.readable)
+
+    def new_object(self, handler):
+        object_id = self.next_id
+        self.next_id += 1
+        self.objects[object_id] = handler
+        return object_id
+
+    def send(self, object_id, opcode, body):
+        self.sock.sendall(struct.pack(
+            "=II", object_id, (8 + len(body)) << 16 | opcode) + body)
+
+    def readable(self, *_args):
+        data = self.sock.recv(4096)
+        if not data:
+            print("fullscreen: compositor connection closed", flush=True)
+            self.set(False)
+            return GLib.SOURCE_REMOVE
+        self.buffer += data
+        while len(self.buffer) >= 8:
+            object_id, word = struct.unpack_from("=II", self.buffer)
+            size = word >> 16
+            if len(self.buffer) < size:
+                break
+            body, self.buffer = self.buffer[8:size], self.buffer[size:]
+            handler = self.objects.get(object_id)
+            if handler:
+                handler(object_id, word & 0xFFFF, body)
+        return GLib.SOURCE_CONTINUE
+
+    @staticmethod
+    def string(body, offset):
+        """Return (text, offset after it) for a wire string at offset."""
+        length, = struct.unpack_from("=I", body, offset)
+        text = body[offset + 4:offset + 4 + length - 1].decode()
+        return text, offset + 4 + (length + 3) // 4 * 4
+
+    def on_display(self, _id, opcode, body):
+        if opcode == 0:  # error
+            print("fullscreen: wayland error",
+                  self.string(body, 8)[0], flush=True)
+
+    def on_registry(self, registry, opcode, body):
+        if opcode != 0:  # only global
+            return
+        name, = struct.unpack_from("=I", body)
+        interface, offset = self.string(body, 4)
+        version, = struct.unpack_from("=I", body, offset)
+        if interface == self.MANAGER:
+            manager = self.new_object(self.on_manager)
+            iface = interface.encode() + b"\0"
+            iface += b"\0" * (-len(iface) % 4)
+            self.send(registry, 0, struct.pack("=II", name, len(
+                interface) + 1) + iface + struct.pack(
+                "=II", min(version, 3), manager))  # wl_registry.bind
+
+    def on_manager(self, _id, opcode, body):
+        if opcode == 0:  # toplevel
+            handle, = struct.unpack_from("=I", body)
+            self.objects[handle] = self.on_handle
+            self.handles[handle] = [set(), None]
+
+    def on_handle(self, handle, opcode, body):
+        states = self.handles[handle]
+        if opcode == 4:  # state
+            length, = struct.unpack_from("=I", body)
+            states[1] = set(struct.unpack_from(f"={length // 4}I", body, 4))
+        elif opcode == 5:  # done
+            if states[1] is not None:
+                states[0], states[1] = states[1], None
+            self.update()
+        elif opcode == 6:  # closed
+            del self.handles[handle], self.objects[handle]
+            self.send(handle, self.HANDLE_DESTROY, b"")
+            self.update()
+
+    def update(self):
+        self.set(any({self.ACTIVATED, self.FULLSCREEN} <= current
+                     for current, _pending in self.handles.values()))
+
+    def set(self, fullscreen):
+        if fullscreen != self.fullscreen:
+            self.fullscreen = fullscreen
+            self.report(fullscreen)
+
+
+def init_layer_surface(window):
+    """Make window a layer surface along the bottom edge of the screen."""
+    window.add_css_class("og-home-panel")
+    LayerShell.init_for_window(window)
+    LayerShell.set_namespace(window, "og-home-panel")
+    # Overlay, so Phosh's overview and the OSK stack above the panel
+    # instead of covering it.
+    LayerShell.set_layer(window, LayerShell.Layer.OVERLAY)
+    for edge in (LayerShell.Edge.BOTTOM, LayerShell.Edge.LEFT,
+                 LayerShell.Edge.RIGHT):
+        LayerShell.set_anchor(window, edge, True)
+    # Never take keyboard focus, so injected keys reach the app.
+    LayerShell.set_keyboard_mode(window, LayerShell.KeyboardMode.NONE)
+
+
+class HomePanel(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        init_layer_surface(self)
+
+        self.more = nav_button("view-more-symbolic",
+                               lambda _b: self.update_visibility(),
+                               toggle=True)
+        self.bar = button_row("bar", [
+            nav_button("go-previous-symbolic", self.on_back,
+                       lambda: send_keys("escape")),
+            nav_button("view-app-grid-symbolic",
+                       lambda _b: send_keys("app-view")),
+            nav_button("input-keyboard-symbolic",
+                       lambda _b: set_osk_visible(not osk_visible())),
+            self.more,
+        ], spread=True, height_request=BAR_HEIGHT)
+        self.set_child(self.bar)
+        self.connect("map", self.on_map)
+
+        # The quick-actions row is a surface of its own above the bar, so
+        # the bar's surface never changes size. Resizing a layer-shell window
+        # left the bar off the bottom edge or short of the full width.
+        self.actions = Gtk.Window(application=app)
+        init_layer_surface(self.actions)
+        # Overlap the app instead of resizing it.
+        LayerShell.set_exclusive_zone(self.actions, -1)
+        # Packed from the left, so each action stays in the same place
+        # whatever the screen width, for muscle memory.
+        self.actions.set_child(button_row("actions", [
+            nav_button(icon, lambda _b, a=action: send_keys(a))
+            for icon, action in QUICK_ACTIONS]))
+
+        # The lock screen is also on the overlay layer; keep off it.
+        self.hidden_by = set()
+        self.system_bus = watch_locked(
+            lambda locked: self.hide_for("locked", locked))
+        # Phosh's quick-settings drawer is on the top layer, below the panel,
+        # and its bottom row would be covered.
+        self.atspi = AtspiHelper(
+            lambda drawer_open: self.hide_for("drawer open", drawer_open))
+        self.fullscreen = FullscreenWatcher(
+            lambda fullscreen: self.hide_for("fullscreen", fullscreen))
+
+    def on_map(self, _window):
+        # Reserve only the bar, and put the actions row right above it.
+        # Measure it, since the theme's button padding makes it taller than
+        # BAR_HEIGHT.
+        height = self.bar.measure(Gtk.Orientation.VERTICAL, -1)[1]
+        LayerShell.set_exclusive_zone(self, height)
+        LayerShell.set_margin(self.actions, LayerShell.Edge.BOTTOM, height)
+        print("exclusive zone:", height, flush=True)
+
+    def hide_for(self, reason, hidden):
+        """Hide the panel while any reason (lock, drawer, fullscreen) applies."""
+        print(f"{reason}: {hidden}", flush=True)
+        if hidden:
+            self.hidden_by.add(reason)
+        else:
+            self.hidden_by.discard(reason)
+        self.update_visibility()
+
+    def update_visibility(self):
+        self.set_visible(not self.hidden_by)
+        self.actions.set_visible(not self.hidden_by and self.more.get_active())
+
+    def on_back(self, _button):
+        self.atspi.send(f"back {time.monotonic()}")
+
+
+def main():
+    if HELPER_FLAG in sys.argv:
+        helper_main()
+        return
+    app = Gtk.Application(application_id=APP_ID)
+    Lfb.init(app.get_application_id())
+
+    def activate(app):
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        # A second launch only re-activates the running instance.
+        if not app.get_active_window():
+            HomePanel(app)
+
+    app.connect("activate", activate)
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
