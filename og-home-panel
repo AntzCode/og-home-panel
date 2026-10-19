@@ -76,20 +76,24 @@ KEYS = {
     "undo": ["-M", "ctrl", "-k", "z", "-m", "ctrl"],
     "redo": ["-M", "ctrl", "-M", "shift", "-k", "z", "-m", "shift", "-m", "ctrl"],
     "select-all": ["-M", "ctrl", "-k", "a", "-m", "ctrl"],
+    # Collapses the selection to its end in text fields. A non-editable web
+    # page has no key for this.
+    "deselect": ["-k", "Right"],
     # Right first, so a caret at the start of a word moves into it; then
     # back to the word's start and select to its end.
     "select-word": ["-k", "Right", "-M", "ctrl", "-k", "Left",
                     "-M", "shift", "-k", "Right", "-m", "shift", "-m", "ctrl"],
 }
 
+# (icon, tap action, long-press action or None)
 QUICK_ACTIONS = [
-    ("edit-undo-symbolic", "undo"),
-    ("edit-redo-symbolic", "redo"),
-    ("edit-cut-symbolic", "cut"),
-    ("edit-copy-symbolic", "copy"),
-    ("edit-paste-symbolic", "paste"),
-    ("edit-select-symbolic", "select-word"),
-    ("edit-select-all-symbolic", "select-all"),
+    ("edit-undo-symbolic", "undo", None),
+    ("edit-redo-symbolic", "redo", None),
+    ("edit-cut-symbolic", "cut", None),
+    ("edit-copy-symbolic", "copy", None),
+    ("edit-paste-symbolic", "paste", None),
+    ("edit-select-symbolic", "select-word", None),
+    ("edit-select-all-symbolic", "select-all", "deselect"),
 ]
 
 CSS = b"""
@@ -695,8 +699,9 @@ class HomePanel(Gtk.ApplicationWindow):
         # Packed from the left, so each action stays in the same place
         # whatever the screen width, for muscle memory.
         self.actions.set_child(button_row("actions", [
-            nav_button(icon, lambda _b, a=action: send_keys(a))
-            for icon, action in QUICK_ACTIONS]))
+            nav_button(icon, lambda _b, a=action: send_keys(a),
+                       held and (lambda h=held: send_keys(h)))
+            for icon, action, held in QUICK_ACTIONS]))
 
         # In fullscreen the bar is hidden, so the rotate offer floats on its
         # own where ⋯ would be, without resizing the app.

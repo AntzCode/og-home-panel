@@ -20,6 +20,8 @@ Status: early development. It runs on Phosh. Plasma Mobile, wlroots shells (Sway
 
 Every button gives a short haptic tick (via feedbackd) as you touch it.
 
+Long-press select all to deselect (in text fields; a whole web page can only be deselected by tapping it).
+
 The quick-actions row sits above the bar and overlaps the app (and the on-screen keyboard's bottom row), so nothing resizes or jumps when it opens or closes.
 
 The panel hides itself on the lock screen, while the quick-settings drawer is pulled down, and while the focused app is fullscreen.
