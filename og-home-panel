@@ -39,7 +39,7 @@ gi.require_version("Gtk4LayerShell", "1.0")
 gi.require_version("Lfb", "0.0")
 from gi.repository import Atspi, Gdk, Gio, GLib, Gtk  # noqa: E402
 from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
-from gi.repository import Lfb  # noqa: E402
+from gi.repository import Lfb, Pango  # noqa: E402
 
 APP_ID = "com.antzcode.og_home_panel"
 BAR_HEIGHT = 44
@@ -61,8 +61,8 @@ TOP_PANEL = "phosh panel"
 ORIENTATION_TRANSFORMS = {"normal": 0, "left-up": 1, "bottom-up": 2,
                           "right-up": 3}
 ROTATE_OFFER_SECONDS = 4
-# Stevia shows itself again when the screen rotates; how long after a
-# rotation the panel undoes that.
+# Stevia shows itself again when the screen rotates, and when the overview
+# opens; how long afterwards the panel undoes that.
 OSK_RESHOW_SECONDS = 2
 
 # wtype arguments per action: -M/-m press/release a modifier, -k taps a key.
@@ -108,6 +108,12 @@ button.nav.floating:active { background: #3a3a3a; }
 button.nav.turn-1 { -gtk-icon-transform: rotate(-90deg); }
 button.nav.turn-2 { -gtk-icon-transform: rotate(180deg); }
 button.nav.turn-3 { -gtk-icon-transform: rotate(90deg); }
+window.og-home-panel.switcher { background: rgba(0, 0, 0, 0.5); }
+.apps { background: #1c1c1c; border-top: 1px solid #333; }
+button.app { min-height: 48px; padding: 4px 16px; border-radius: 0;
+             background: none; color: #eee; border: none; box-shadow: none; }
+button.app.current { background: #2a2a2a; }
+button.app:active { background: #3a3a3a; }
 """
 
 
@@ -452,8 +458,19 @@ def watch_locked(callback):
     return bus
 
 
-class FullscreenWatcher:
-    """Report whether the focused window is fullscreen.
+class Toplevel:
+    """An app window, as wlr-foreign-toplevel reports it."""
+
+    def __init__(self):
+        self.title = self.app_id = ""
+        self.states = set()
+        self.pending = None  # States waiting for the next done event
+        self.used = 0  # When it was last activated, for most-recent order
+
+
+class ToplevelWatcher:
+    """Track the open app windows, and report whether the focused one is
+    fullscreen.
 
     A minimal Wayland client for wlr-foreign-toplevel-management, which phoc
     implements. GTK doesn't expose the protocol and pywayland lacks the wlr
@@ -461,14 +478,17 @@ class FullscreenWatcher:
     """
     MANAGER = "zwlr_foreign_toplevel_manager_v1"
     ACTIVATED, FULLSCREEN = 2, 3  # zwlr_foreign_toplevel_handle_v1.state
-    HANDLE_DESTROY = 7
+    HANDLE_ACTIVATE, HANDLE_DESTROY = 4, 7
 
-    def __init__(self, report):
+    def __init__(self, report, on_windows):
         self.report = report
+        self.on_windows = on_windows
         self.fullscreen = False
         self.objects = {1: self.on_display}
         self.next_id = 2
-        self.handles = {}  # id -> [current states, pending states]
+        self.handles = {}  # id -> Toplevel
+        self.seat = None
+        self.activations = 0
         self.buffer = b""
         display = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -493,8 +513,9 @@ class FullscreenWatcher:
     def readable(self, *_args):
         data = self.sock.recv(4096)
         if not data:
-            print("fullscreen: compositor connection closed", flush=True)
-            self.set(False)
+            print("toplevels: compositor connection closed", flush=True)
+            self.handles.clear()
+            self.update()
             return GLib.SOURCE_REMOVE
         self.buffer += data
         while len(self.buffer) >= 8:
@@ -512,13 +533,23 @@ class FullscreenWatcher:
     def string(body, offset):
         """Return (text, offset after it) for a wire string at offset."""
         length, = struct.unpack_from("=I", body, offset)
-        text = body[offset + 4:offset + 4 + length - 1].decode()
+        text = body[offset + 4:offset + 4 + length - 1].decode(
+            errors="replace")
         return text, offset + 4 + (length + 3) // 4 * 4
 
     def on_display(self, _id, opcode, body):
         if opcode == 0:  # error
-            print("fullscreen: wayland error",
+            print("toplevels: wayland error",
                   self.string(body, 8)[0], flush=True)
+
+    def bind(self, registry, name, interface, version, handler):
+        object_id = self.new_object(handler)
+        iface = interface.encode() + b"\0"
+        iface += b"\0" * (-len(iface) % 4)
+        self.send(registry, 0, struct.pack("=II", name, len(
+            interface) + 1) + iface + struct.pack(
+            "=II", version, object_id))  # wl_registry.bind
+        return object_id
 
     def on_registry(self, registry, opcode, body):
         if opcode != 0:  # only global
@@ -527,38 +558,63 @@ class FullscreenWatcher:
         interface, offset = self.string(body, 4)
         version, = struct.unpack_from("=I", body, offset)
         if interface == self.MANAGER:
-            manager = self.new_object(self.on_manager)
-            iface = interface.encode() + b"\0"
-            iface += b"\0" * (-len(iface) % 4)
-            self.send(registry, 0, struct.pack("=II", name, len(
-                interface) + 1) + iface + struct.pack(
-                "=II", min(version, 3), manager))  # wl_registry.bind
+            self.bind(registry, name, interface, min(version, 3),
+                      self.on_manager)
+        elif interface == "wl_seat" and self.seat is None:
+            # Activating a window needs a seat; its events aren't needed.
+            self.seat = self.bind(registry, name, interface, 1,
+                                  lambda *_args: None)
 
     def on_manager(self, _id, opcode, body):
         if opcode == 0:  # toplevel
             handle, = struct.unpack_from("=I", body)
             self.objects[handle] = self.on_handle
-            self.handles[handle] = [set(), None]
+            self.handles[handle] = Toplevel()
 
     def on_handle(self, handle, opcode, body):
-        states = self.handles[handle]
-        if opcode == 4:  # state
+        window = self.handles[handle]
+        if opcode == 0:  # title
+            window.title = self.string(body, 0)[0]
+        elif opcode == 1:  # app_id
+            window.app_id = self.string(body, 0)[0]
+        elif opcode == 4:  # state
             length, = struct.unpack_from("=I", body)
-            states[1] = set(struct.unpack_from(f"={length // 4}I", body, 4))
+            window.pending = set(
+                struct.unpack_from(f"={length // 4}I", body, 4))
         elif opcode == 5:  # done
-            if states[1] is not None:
-                states[0], states[1] = states[1], None
+            # The compositor sends a window's changes (title, states...)
+            # first, then "done" to say they're complete; only now do the
+            # pending states take effect.
+            if window.pending is not None:
+                # The window just became the focused one (it wasn't before).
+                # Stamp it from an ever-increasing counter, so sorting by
+                # stamp gives most-recently-used order for the switcher.
+                # Checking the old states means a state change while it
+                # stays focused (e.g. going fullscreen) doesn't count.
+                if (self.ACTIVATED in window.pending
+                        and self.ACTIVATED not in window.states):
+                    self.activations += 1
+                    window.used = self.activations
+                window.states, window.pending = window.pending, None
             self.update()
         elif opcode == 6:  # closed
             del self.handles[handle], self.objects[handle]
             self.send(handle, self.HANDLE_DESTROY, b"")
             self.update()
 
-    def update(self):
-        self.set(any({self.ACTIVATED, self.FULLSCREEN} <= current
-                     for current, _pending in self.handles.values()))
+    def windows(self):
+        """(handle, Toplevel) pairs, most recently used first."""
+        return sorted(self.handles.items(), key=lambda item: -item[1].used)
 
-    def set(self, fullscreen):
+    def activate(self, handle):
+        if handle in self.handles and self.seat is not None:
+            self.send(handle, self.HANDLE_ACTIVATE,
+                      struct.pack("=I", self.seat))
+
+    def update(self):
+        self.on_windows()
+        fullscreen = any({self.ACTIVATED, self.FULLSCREEN} <= window.states
+                         for window in self.handles.values())
         if fullscreen != self.fullscreen:
             self.fullscreen = fullscreen
             self.report(fullscreen)
@@ -656,13 +712,87 @@ def init_layer_surface(window):
     LayerShell.set_keyboard_mode(window, LayerShell.KeyboardMode.NONE)
 
 
+def app_info(app_id):
+    """The installed app a window's app ID belongs to, or None."""
+    try:
+        return Gio.DesktopAppInfo.new(app_id + ".desktop")
+    except TypeError:  # Not found
+        pass
+    for info in Gio.AppInfo.get_all():
+        if app_id in (info.get_startup_wm_class(),
+                      info.get_id().removesuffix(".desktop").lower()):
+            return info
+    return None
+
+
+class AppSwitcher(Gtk.Window):
+    """The running apps, like Alt+Tab: tap one to switch to it.
+
+    Covers the screen above the bar; the most recently used app is nearest
+    the bar, and tapping the dimmed space above the list closes it.
+    """
+
+    def __init__(self, app, toplevels, on_done):
+        super().__init__(application=app)
+        init_layer_surface(self)
+        self.add_css_class("switcher")
+        LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+        LayerShell.set_exclusive_zone(self, -1)
+        self.toplevels = toplevels
+        self.on_done = on_done
+        self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                            css_classes=["apps"])
+        outside = Gtk.Box(vexpand=True)
+        tap = Gtk.GestureClick()
+        tap.connect("released", lambda *_args: self.on_done())
+        outside.add_controller(tap)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(outside)
+        box.append(Gtk.ScrolledWindow(
+            child=self.list, hscrollbar_policy=Gtk.PolicyType.NEVER,
+            propagate_natural_height=True))
+        self.set_child(box)
+
+    def refresh(self):
+        """Rebuild the list; returns False when no app is running."""
+        while child := self.list.get_first_child():
+            self.list.remove(child)
+        windows = self.toplevels.windows()
+        for handle, window in reversed(windows):
+            info = app_info(window.app_id)
+            icon = Gtk.Image(pixel_size=32)
+            if info and info.get_icon():
+                icon.set_from_gicon(info.get_icon())
+            else:
+                icon.set_from_icon_name("application-x-executable")
+            row = Gtk.Box(spacing=12)
+            row.append(icon)
+            row.append(Gtk.Label(
+                label=window.title or (info and info.get_display_name())
+                or window.app_id, xalign=0, hexpand=True,
+                ellipsize=Pango.EllipsizeMode.END))
+            button = Gtk.Button(child=row, css_classes=["app"])
+            if ToplevelWatcher.ACTIVATED in window.states:
+                button.add_css_class("current")
+            touch = Gtk.GestureClick()
+            touch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            touch.connect("pressed", haptic)
+            button.add_controller(touch)
+            button.connect("clicked", self.on_pick, handle)
+            self.list.append(button)
+        return bool(windows)
+
+    def on_pick(self, _button, handle):
+        self.toplevels.activate(handle)
+        self.on_done()
+
+
 class HomePanel(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app)
         init_layer_surface(self)
 
-        self.more = nav_button("view-more-symbolic",
-                               lambda _b: self.update_visibility(),
+        self.more = nav_button("view-more-symbolic", self.on_more,
                                toggle=True)
         # The rotate offer briefly takes the ⋯ button's place.
         self.rotate = nav_button("rotation-allowed-symbolic", self.on_rotate)
@@ -680,8 +810,8 @@ class HomePanel(Gtk.ApplicationWindow):
         self.bar = button_row("bar", [
             nav_button("go-previous-symbolic", self.on_back,
                        lambda: send_keys("escape")),
-            nav_button("view-app-grid-symbolic",
-                       lambda _b: send_keys("app-view")),
+            nav_button("view-app-grid-symbolic", self.on_apps,
+                       self.on_apps_held),
             nav_button("input-keyboard-symbolic",
                        lambda _b: set_osk_visible(not osk_visible())),
             self.more_slot,
@@ -714,6 +844,14 @@ class HomePanel(Gtk.ApplicationWindow):
         self.floating.add_css_class("floating")
         self.rotate_float.set_child(self.floating)
 
+        # The open app windows, for the switcher and fullscreen hiding.
+        self.toplevels = ToplevelWatcher(
+            lambda fullscreen: self.hide_for("fullscreen", fullscreen),
+            self.on_windows)
+        self.switching = False
+        self.switcher = AppSwitcher(app, self.toplevels,
+                                    lambda: self.show_switcher(False))
+
         self.rotation = RotationWatcher(self.offer_rotation)
         # The lock screen is also on the overlay layer; keep off it.
         self.hidden_by = set()
@@ -723,8 +861,6 @@ class HomePanel(Gtk.ApplicationWindow):
         # and its bottom row would be covered.
         self.atspi = AtspiHelper(
             lambda drawer_open: self.hide_for("drawer open", drawer_open))
-        self.fullscreen = FullscreenWatcher(
-            lambda fullscreen: self.hide_for("fullscreen", fullscreen))
 
     def on_map(self, _window):
         # Reserve only the bar, and put the actions row right above it.
@@ -733,6 +869,7 @@ class HomePanel(Gtk.ApplicationWindow):
         height = self.bar.measure(Gtk.Orientation.VERTICAL, -1)[1]
         LayerShell.set_exclusive_zone(self, height)
         LayerShell.set_margin(self.actions, LayerShell.Edge.BOTTOM, height)
+        LayerShell.set_margin(self.switcher, LayerShell.Edge.BOTTOM, height)
         print("exclusive zone:", height, flush=True)
 
     def hide_for(self, reason, hidden):
@@ -749,11 +886,52 @@ class HomePanel(Gtk.ApplicationWindow):
     def update_visibility(self):
         self.set_visible(not self.hidden_by)
         self.actions.set_visible(not self.hidden_by and self.more.get_active())
+        self.switcher.set_visible(not self.hidden_by and self.switching)
         self.rotate_float.set_visible(self.offered is not None
                                       and self.hidden_by == {"fullscreen"})
 
     def on_back(self, _button):
+        if self.switching:
+            self.show_switcher(False)
+            return
         self.atspi.send(f"back {time.monotonic()}")
+
+    def on_apps(self, _button):
+        if self.switching:
+            self.show_switcher(False)
+        else:
+            self.open_overview()
+
+    def on_apps_held(self):
+        if self.switching:
+            self.show_switcher(False)
+        elif self.toplevels.windows():
+            self.show_switcher(True)
+        else:  # Nothing to switch to; open the overview to start an app.
+            self.open_overview()
+
+    def open_overview(self):
+        # Phosh focuses the overview's search field, which brings up the
+        # keyboard and covers the app grid; keep it closed.
+        self.keep_osk_closed()
+        send_keys("app-view")
+
+    def on_more(self, _button):
+        if self.more.get_active():
+            self.switching = False
+        self.update_visibility()
+
+    def show_switcher(self, show):
+        if show:
+            self.switcher.refresh()
+            # One overlay at a time: the quick-actions row closes.
+            self.more.set_active(False)
+        self.switching = show
+        self.update_visibility()
+
+    def on_windows(self):
+        if self.switching and not self.switcher.refresh():
+            self.show_switcher(False)
 
     def offer_rotation(self, transform):
         """Show the rotate button for a few seconds, or None to take it
@@ -797,15 +975,20 @@ class HomePanel(Gtk.ApplicationWindow):
             return
         print("rotate to transform", transform, flush=True)
         try:
-            if not osk_visible():
-                self.osk_hidden_until = time.monotonic() + OSK_RESHOW_SECONDS
+            self.keep_osk_closed()
             self.rotation.rotate(transform)
         except GLib.Error as error:
             print("rotate failed:", error.message, flush=True)
 
+    def keep_osk_closed(self):
+        """If the keyboard is closed, close it again should it show itself
+        within OSK_RESHOW_SECONDS."""
+        if not osk_visible():
+            self.osk_hidden_until = time.monotonic() + OSK_RESHOW_SECONDS
+
     def on_osk_changed(self, *args):
         # Stevia rebuilds itself for the new screen size and comes back
-        # visible; keep it closed if it was closed before the rotation.
+        # visible after a rotation; the overview's search field opens it.
         if (args[5].unpack()[1].get("Visible")
                 and time.monotonic() < self.osk_hidden_until):
             self.osk_hidden_until = 0
