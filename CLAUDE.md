@@ -2,7 +2,7 @@
 
 Android-style Back, app switcher and quick actions for Linux phones, shown as a bar at the bottom of the screen. Goal: the missing piece that makes a Linux phone feel like home. See README.md for user-facing behavior.
 
-- Repo: `github.com/AntzCode/og-home-panel` (private until the first release)
+- Repo: `github.com/AntzCode/og-home-panel` (public)
 - App ID: `com.antzcode.og_home_panel`. Underscores, because the ID is also a D-Bus name and object path, and hyphens aren't allowed there. Use `og-home-panel` everywhere else: the command, the systemd unit, the layer-shell namespace and the CSS class.
 - License: GPL-3.0-or-later. Every source file starts with an SPDX header.
 
