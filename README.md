@@ -21,6 +21,8 @@ Status: early development. It runs on Phosh. Plasma Mobile, wlroots shells (Sway
 The panel menu has:
 
 - **Fit *app* to the screen**: for an app whose window is too big for the screen, turns on Phosh's scale-to-fit for the app you're in, which shrinks the window until all of it shows. Once it's on, the item turns it off again (*Stop fitting…*).
+- **Hide the buttons in *app***: hides the panel whenever that app is in front, for apps that need the whole screen, such as a camera. The floating rotate button still appears there.
+- **Settings**: lists the apps the panel hides in, each with a button to show the panel there again.
 - **About OG Home Panel**
 
 Every button gives a short haptic tick (via feedbackd) as you touch it.
@@ -29,7 +31,7 @@ Long-press select all to deselect (in text fields; a whole web page can only be 
 
 The quick-actions row sits above the bar and overlaps the app (and the on-screen keyboard's bottom row), so nothing resizes or jumps when it opens or closes.
 
-The panel hides itself on the lock screen, while the quick-settings drawer is pulled down, and while the focused app is fullscreen.
+The panel hides itself on the lock screen, while the quick-settings drawer is pulled down, while the focused app is fullscreen, and in the apps you've hidden it in. Settings are saved in `~/.config/og-home-panel/settings.json`.
 
 ## How Back works
 

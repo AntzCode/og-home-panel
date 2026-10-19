@@ -16,6 +16,7 @@ AT-SPI runs in a helper process (the same script, run with --atspi-helper).
 The panel itself runs in a child process (--panel), which the first process
 restarts if it crashes.
 """
+import json
 import os
 import re
 import signal
@@ -104,6 +105,10 @@ APP_ICON = "go-home-symbolic"
 # SECRET_TAP_SECONDS of the one before.
 SECRET_TAPS = 10
 SECRET_TAP_SECONDS = 1.5
+# The user's settings, as JSON.
+SETTINGS_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME")
+                             or os.path.expanduser("~/.config"),
+                             "og-home-panel", "settings.json")
 BAR_HEIGHT = 44
 
 BACK_NAME = re.compile(r"^(go )?back\b", re.IGNORECASE)
@@ -176,6 +181,8 @@ button.row { min-height: 48px; padding: 4px 16px; border-radius: 0;
              background: none; color: #eee; border: none; box-shadow: none; }
 button.row.current { background: #2a2a2a; }
 button.row:active { background: #3a3a3a; }
+window.og-home-panel.settings { background: var(--window-bg-color);
+                                color: var(--window-fg-color); }
 window.og-home-panel.icon-browser { background: #1c1c1c; color: #eee; }
 .icon-browser .header { padding: 4px 8px; }
 .icon-browser gridview > child { padding: 8px 2px; }
@@ -881,12 +888,36 @@ def phoc_app_settings(app_id):
         "sm.puri.phoc.application", f"/sm/puri/phoc/application/{name}/")
 
 
+class Preferences:
+    """The user's settings, kept in SETTINGS_FILE."""
+
+    def __init__(self):
+        try:
+            with open(SETTINGS_FILE) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        # App IDs of the apps the panel hides in.
+        self.hidden_apps = list(data.get("hidden-apps", []))
+
+    def save(self):
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        # Write a new file and swap it in, so a crash can't leave half a file.
+        temp = SETTINGS_FILE + ".new"
+        with open(temp, "w") as f:
+            json.dump({"hidden-apps": self.hidden_apps}, f, indent=2)
+        os.replace(temp, SETTINGS_FILE)
+
+
 class PanelMenu(SheetMenu):
     """The panel's own menu (⋯ long press)."""
 
-    def __init__(self, app, toplevels, on_done, on_about):
+    def __init__(self, app, toplevels, on_done, on_hide_app, on_settings,
+                 on_about):
         super().__init__(app, on_done)
         self.toplevels = toplevels
+        self.on_hide_app = on_hide_app
+        self.on_settings = on_settings
         self.on_about = on_about
 
     def refresh(self):
@@ -904,6 +935,11 @@ class PanelMenu(SheetMenu):
                 self.add_row("phone-apple-iphone-symbolic",
                              f"Fit {name} to the screen",
                              lambda: self.set_fit(settings, True))
+            self.add_row("view-conceal-symbolic",
+                         f"Hide the buttons in {name}",
+                         lambda app_id=window.app_id: self.on_hide_app(app_id))
+        self.add_row("preferences-system-symbolic", "Settings",
+                     self.on_settings)
         self.add_row("help-about-symbolic", f"About {APP_NAME}",
                      self.on_about)
         return True
@@ -930,6 +966,71 @@ def find_widget(widget, match):
             return found
         child = child.get_next_sibling()
     return None
+
+
+class SettingsScreen(Gtk.Window):
+    """The panel's settings: for now, the apps it hides in, each with a
+    button to show the panel there again."""
+
+    def __init__(self, app, prefs, on_change, on_close):
+        super().__init__(application=app)
+        init_layer_surface(self)
+        self.add_css_class("settings")
+        LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+        LayerShell.set_exclusive_zone(self, -1)
+        self.prefs = prefs
+        self.on_change = on_change
+        header = Adw.HeaderBar(show_start_title_buttons=False,
+                               show_end_title_buttons=False,
+                               title_widget=Adw.WindowTitle(title="Settings"))
+        close = Gtk.Button(icon_name="window-close-symbolic")
+        close.connect("clicked", lambda _b: on_close())
+        header.pack_end(close)
+        self.hidden = Adw.PreferencesGroup(
+            title="Hidden in these apps",
+            description="The buttons hide while one of these apps is in "
+                        "front. Remove an app to show them there again.")
+        page = Adw.PreferencesPage()
+        page.add(self.hidden)
+        view = Adw.ToolbarView(content=page)
+        view.add_top_bar(header)
+        self.set_child(view)
+        self.rows = []
+
+    def refresh(self):
+        for row in self.rows:
+            self.hidden.remove(row)
+        self.rows = []
+        for app_id in self.prefs.hidden_apps:
+            info = app_info(app_id)
+            row = Adw.ActionRow(
+                title=info.get_display_name() if info else app_id,
+                subtitle=app_id)
+            icon = Gtk.Image(pixel_size=32)
+            if info and info.get_icon():
+                icon.set_from_gicon(info.get_icon())
+            else:
+                icon.set_from_icon_name("application-x-executable")
+            row.add_prefix(icon)
+            remove = Gtk.Button(icon_name="user-trash-symbolic",
+                                valign=Gtk.Align.CENTER,
+                                tooltip_text="Show the buttons here again",
+                                css_classes=["flat"])
+            remove.connect("clicked", lambda _b, a=app_id: self.remove(a))
+            row.add_suffix(remove)
+            self.add_row(row)
+        if not self.rows:
+            self.add_row(Adw.ActionRow(title="None yet", sensitive=False))
+
+    def add_row(self, row):
+        self.hidden.add(row)
+        self.rows.append(row)
+
+    def remove(self, app_id):
+        self.prefs.hidden_apps.remove(app_id)
+        self.prefs.save()
+        self.refresh()
+        self.on_change()
 
 
 class IconBrowser(Gtk.Window):
@@ -1182,6 +1283,9 @@ class HomePanel(Gtk.ApplicationWindow):
         self.rotate_float.set_child(self.floating)
 
         # The open app windows, for the switcher and fullscreen hiding.
+        # Why the panel is hidden (lock, drawer, fullscreen, hidden app).
+        self.hidden_by = set()
+        self.prefs = Preferences()
         self.toplevels = ToplevelWatcher(
             lambda fullscreen: self.hide_for("fullscreen", fullscreen),
             self.on_windows)
@@ -1191,7 +1295,12 @@ class HomePanel(Gtk.ApplicationWindow):
                                     lambda: self.show_menu(None))
         self.panel_menu = PanelMenu(app, self.toplevels,
                                     lambda: self.show_menu(None),
+                                    self.hide_app,
+                                    lambda: self.show_settings(True),
                                     self.show_about)
+        self.settings_open = False
+        self.settings = SettingsScreen(app, self.prefs, self.on_windows,
+                                       lambda: self.show_settings(False))
         self.about_open = False
         self.about = AboutScreen(app, lambda: self.show_about(False),
                                  lambda: self.show_icons(True))
@@ -1200,7 +1309,6 @@ class HomePanel(Gtk.ApplicationWindow):
 
         self.rotation = RotationWatcher(self.offer_rotation)
         # The lock screen is also on the overlay layer; keep off it.
-        self.hidden_by = set()
         self.system_bus = watch_locked(
             lambda locked: self.hide_for("locked", locked))
         # Phosh's quick-settings drawer is on the top layer, below the panel,
@@ -1218,12 +1326,13 @@ class HomePanel(Gtk.ApplicationWindow):
         # The About screen too: the bar would cover the bottom of its
         # dialog, as it sits above it in the overlay layer.
         for surface in (self.switcher, self.panel_menu, self.about,
-                        self.icons):
+                        self.settings, self.icons):
             LayerShell.set_margin(surface, LayerShell.Edge.BOTTOM, height)
         print("exclusive zone:", height, flush=True)
 
     def hide_for(self, reason, hidden):
-        """Hide the panel while any reason (lock, drawer, fullscreen) applies."""
+        """Hide the panel while any reason (lock, drawer, fullscreen, hidden
+        app) applies."""
         print(f"{reason}: {hidden}", flush=True)
         if hidden:
             self.hidden_by.add(reason)
@@ -1239,13 +1348,20 @@ class HomePanel(Gtk.ApplicationWindow):
         for menu in (self.switcher, self.panel_menu):
             menu.set_visible(not self.hidden_by and self.menu is menu)
         self.about.set_visible(not self.hidden_by and self.about_open)
+        self.settings.set_visible(not self.hidden_by and self.settings_open)
         self.icons.set_visible(not self.hidden_by and self.icons_open)
-        self.rotate_float.set_visible(self.offered is not None
-                                      and self.hidden_by == {"fullscreen"})
+        # Where the bar is hidden only because of the app in front, the
+        # rotate offer floats on its own (a camera app, a video).
+        self.rotate_float.set_visible(
+            self.offered is not None and bool(self.hidden_by)
+            and self.hidden_by <= {"fullscreen", "hidden app"})
 
     def on_back(self, _button):
         if self.icons_open:
             self.show_icons(False)
+            return
+        if self.settings_open:
+            self.show_settings(False)
             return
         if self.menu:
             self.show_menu(None)
@@ -1301,6 +1417,19 @@ class HomePanel(Gtk.ApplicationWindow):
         else:
             self.about.close_dialog()
 
+    def show_settings(self, show):
+        if show:
+            self.settings.refresh()
+        self.settings_open = show
+        self.update_visibility()
+
+    def hide_app(self, app_id):
+        """Hide the panel whenever this app is in front, from now on."""
+        if app_id not in self.prefs.hidden_apps:
+            self.prefs.hidden_apps.append(app_id)
+            self.prefs.save()
+        self.on_windows()
+
     def show_icons(self, show):
         if show:
             self.icons.refresh()
@@ -1310,6 +1439,10 @@ class HomePanel(Gtk.ApplicationWindow):
     def on_windows(self):
         if self.menu is self.switcher and not self.switcher.refresh():
             self.show_menu(None)
+        window = self.toplevels.focused()
+        hidden = bool(window and window.app_id in self.prefs.hidden_apps)
+        if hidden != ("hidden app" in self.hidden_by):
+            self.hide_for("hidden app", hidden)
 
     def offer_rotation(self, transform):
         """Show the rotate button for a few seconds, or None to take it
