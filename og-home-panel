@@ -99,6 +99,11 @@ from gi.repository import Lfb, Pango  # noqa: E402
 APP_ID = "com.antzcode.og_home_panel"
 APP_NAME = "OG Home Panel"
 REPO_URL = "https://github.com/AntzCode/og-home-panel"
+APP_ICON = "go-home-symbolic"
+# Taps on the icon in About that open the icon browser, each within
+# SECRET_TAP_SECONDS of the one before.
+SECRET_TAPS = 10
+SECRET_TAP_SECONDS = 1.5
 BAR_HEIGHT = 44
 
 BACK_NAME = re.compile(r"^(go )?back\b", re.IGNORECASE)
@@ -171,6 +176,10 @@ button.row { min-height: 48px; padding: 4px 16px; border-radius: 0;
              background: none; color: #eee; border: none; box-shadow: none; }
 button.row.current { background: #2a2a2a; }
 button.row:active { background: #3a3a3a; }
+window.og-home-panel.icon-browser { background: #1c1c1c; color: #eee; }
+.icon-browser .header { padding: 4px 8px; }
+.icon-browser gridview > child { padding: 8px 2px; }
+.icon-browser .icon-name { font-size: smaller; }
 """
 
 
@@ -910,23 +919,155 @@ class PanelMenu(SheetMenu):
         Gio.Settings.sync()
 
 
+def find_widget(widget, match):
+    """The first widget in a widget tree (depth first) that match() accepts,
+    or None."""
+    if match(widget):
+        return widget
+    child = widget.get_first_child()
+    while child:
+        if found := find_widget(child, match):
+            return found
+        child = child.get_next_sibling()
+    return None
+
+
+class IconBrowser(Gtk.Window):
+    """Every symbolic icon in the icon theme, to choose icons for the panel:
+    tap one to see its name. A hidden developer screen, opened by tapping
+    the icon in About SECRET_TAPS times.
+
+    Adwaita's own icons are on one tab, and the rest on another. Most of
+    those are installed by apps (into hicolor), so they're missing where
+    that app isn't; the few built into GTK or libadwaita are always there.
+    """
+    GROUPS = ["Adwaita", "Other"]
+
+    def __init__(self, app, on_close):
+        super().__init__(application=app)
+        init_layer_surface(self)
+        self.add_css_class("icon-browser")
+        LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+        LayerShell.set_exclusive_zone(self, -1)
+        # Unlike the panel's other surfaces, it takes the keyboard, for its
+        # search field.
+        LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.ON_DEMAND)
+
+        self.names = {group: Gtk.StringList() for group in self.GROUPS}
+        self.paths = {}  # Icon name -> the file it's loaded from
+        self.filter = Gtk.StringFilter(
+            expression=Gtk.PropertyExpression.new(
+                Gtk.StringObject, None, "string"),
+            match_mode=Gtk.StringFilterMatchMode.SUBSTRING, ignore_case=True)
+        self.filtered = Gtk.FilterListModel(filter=self.filter)
+        self.selection = Gtk.SingleSelection(
+            model=self.filtered, autoselect=False, can_unselect=True)
+        self.selection.connect("notify::selected-item", self.on_selected)
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", self.on_setup)
+        factory.connect("bind", self.on_bind)
+
+        search = Gtk.SearchEntry(placeholder_text="Search icons",
+                                 hexpand=True)
+        search.connect("search-changed",
+                       lambda entry: self.filter.set_search(entry.get_text()))
+        close = nav_button("window-close-symbolic", lambda _b: on_close())
+        header = Gtk.Box(spacing=8, css_classes=["header"])
+        header.append(search)
+        header.append(close)
+        tabs = Gtk.Box(css_classes=["linked", "header"], homogeneous=True)
+        self.tabs = {}
+        for group in self.GROUPS:
+            tab = Gtk.ToggleButton(
+                group=self.tabs.get(self.GROUPS[0]), hexpand=True)
+            tab.connect("toggled", self.on_tab, group)
+            self.tabs[group] = tab
+            tabs.append(tab)
+        # Selectable, so the name can be copied.
+        self.chosen = Gtk.Label(selectable=True, wrap=True,
+                                wrap_mode=Pango.WrapMode.WORD_CHAR,
+                                css_classes=["header"])
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(header)
+        box.append(tabs)
+        box.append(self.chosen)
+        box.append(Gtk.ScrolledWindow(
+            child=Gtk.GridView(model=self.selection, factory=factory,
+                               max_columns=12),
+            hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True))
+        self.set_child(box)
+
+    def refresh(self):
+        theme = Gtk.IconTheme.get_for_display(self.get_display())
+        groups = {group: [] for group in self.GROUPS}
+        for name in sorted(theme.get_icon_names()):
+            if not name.endswith("-symbolic"):
+                continue
+            icon = theme.lookup_icon(name, None, 32, 1,
+                                     Gtk.TextDirection.NONE, 0)
+            # Icons built into GTK or libadwaita have a resource:// URI,
+            # not a path.
+            file = icon.get_file()
+            path = file and (file.get_path() or file.get_uri()) or ""
+            self.paths[name] = path
+            groups["Adwaita" if "/icons/Adwaita/" in path
+                   else "Other"].append(name)
+        for group, names in groups.items():
+            self.names[group].splice(0, self.names[group].get_n_items(),
+                                     names)
+            self.tabs[group].set_label(f"{group} ({len(names)})")
+        self.tabs["Adwaita"].set_active(True)
+        self.on_tab(self.tabs["Adwaita"], "Adwaita")
+
+    def on_tab(self, tab, group):
+        if not tab.get_active():
+            return
+        self.filtered.set_model(self.names[group])
+        self.selection.set_selected(Gtk.INVALID_LIST_POSITION)
+        self.chosen.set_label("Tap an icon to see its name.")
+
+    @staticmethod
+    def on_setup(_factory, item):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.append(Gtk.Image(pixel_size=32))
+        box.append(Gtk.Label(css_classes=["icon-name"], max_width_chars=10,
+                             ellipsize=Pango.EllipsizeMode.MIDDLE))
+        item.set_child(box)
+
+    @staticmethod
+    def on_bind(_factory, item):
+        name = item.get_item().get_string()
+        image = item.get_child().get_first_child()
+        image.set_from_icon_name(name)
+        image.get_next_sibling().set_label(name.removesuffix("-symbolic"))
+
+    def on_selected(self, *_args):
+        item = self.selection.get_selected_item()
+        if item:
+            name = item.get_string()
+            self.chosen.set_label(f"{name}\n{self.paths.get(name, '')}")
+            print("icon:", name, flush=True)
+
+
 class AboutScreen(Adw.Window):
     """A full-screen surface that hosts the About dialog, which libadwaita
     shows inside a window (as a bottom sheet on a phone)."""
 
-    def __init__(self, app, on_closed):
+    def __init__(self, app, on_closed, on_secret):
         super().__init__(application=app)
         init_layer_surface(self)
         LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
         LayerShell.set_exclusive_zone(self, -1)
         self.set_content(Gtk.Box())
         self.on_closed = on_closed
+        self.on_secret = on_secret
         self.dialog = None
+        self.taps = []
 
     def present_dialog(self):
         self.dialog = Adw.AboutDialog(
             application_name=APP_NAME,
-            application_icon="go-home-symbolic",
+            application_icon=APP_ICON,
             developer_name="AntzCode",
             comments="Android-style Back, app switcher and quick actions "
                      "for Linux phones.",
@@ -943,6 +1084,23 @@ class AboutScreen(Adw.Window):
         self.dialog.connect("closed", self.on_dialog_closed)
         self.dialog.connect("activate-link", self.on_link)
         self.dialog.present(self)
+        # Its widgets only exist once it's presented.
+        icon = find_widget(self.dialog, lambda widget: isinstance(
+            widget, Gtk.Image) and widget.get_icon_name() == APP_ICON)
+        if icon:
+            tap = Gtk.GestureClick()
+            tap.connect("released", self.on_icon_tap)
+            icon.add_controller(tap)
+        self.taps = []
+
+    def on_icon_tap(self, *_args):
+        now = time.monotonic()
+        if self.taps and now - self.taps[-1] > SECRET_TAP_SECONDS:
+            self.taps = []
+        self.taps.append(now)
+        if len(self.taps) == SECRET_TAPS:
+            self.close_dialog()
+            self.on_secret()
 
     def on_link(self, _dialog, uri):
         # GTK's own handler exports this window's handle for the portal,
@@ -1035,7 +1193,10 @@ class HomePanel(Gtk.ApplicationWindow):
                                     lambda: self.show_menu(None),
                                     self.show_about)
         self.about_open = False
-        self.about = AboutScreen(app, lambda: self.show_about(False))
+        self.about = AboutScreen(app, lambda: self.show_about(False),
+                                 lambda: self.show_icons(True))
+        self.icons_open = False
+        self.icons = IconBrowser(app, lambda: self.show_icons(False))
 
         self.rotation = RotationWatcher(self.offer_rotation)
         # The lock screen is also on the overlay layer; keep off it.
@@ -1056,7 +1217,8 @@ class HomePanel(Gtk.ApplicationWindow):
         LayerShell.set_margin(self.actions, LayerShell.Edge.BOTTOM, height)
         # The About screen too: the bar would cover the bottom of its
         # dialog, as it sits above it in the overlay layer.
-        for surface in (self.switcher, self.panel_menu, self.about):
+        for surface in (self.switcher, self.panel_menu, self.about,
+                        self.icons):
             LayerShell.set_margin(surface, LayerShell.Edge.BOTTOM, height)
         print("exclusive zone:", height, flush=True)
 
@@ -1077,10 +1239,14 @@ class HomePanel(Gtk.ApplicationWindow):
         for menu in (self.switcher, self.panel_menu):
             menu.set_visible(not self.hidden_by and self.menu is menu)
         self.about.set_visible(not self.hidden_by and self.about_open)
+        self.icons.set_visible(not self.hidden_by and self.icons_open)
         self.rotate_float.set_visible(self.offered is not None
                                       and self.hidden_by == {"fullscreen"})
 
     def on_back(self, _button):
+        if self.icons_open:
+            self.show_icons(False)
+            return
         if self.menu:
             self.show_menu(None)
             return
@@ -1134,6 +1300,12 @@ class HomePanel(Gtk.ApplicationWindow):
             self.about.present_dialog()
         else:
             self.about.close_dialog()
+
+    def show_icons(self, show):
+        if show:
+            self.icons.refresh()
+        self.icons_open = show
+        self.update_visibility()
 
     def on_windows(self):
         if self.menu is self.switcher and not self.switcher.refresh():

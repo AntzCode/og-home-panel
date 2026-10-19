@@ -71,6 +71,8 @@ Deploy to a phone over USB networking and restart the panel:
 tools/deploy.sh                 # default user@172.16.42.1
 ```
 
+To choose icons: open About and tap its icon 10 times. A browser of every symbolic icon in the installed theme opens; tap one to see its name.
+
 On the phone it runs as the transient systemd user unit `og-home-panel`. Logs: `journalctl --user -u og-home-panel`.
 
 ## License
