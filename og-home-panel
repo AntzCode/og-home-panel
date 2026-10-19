@@ -663,6 +663,11 @@ class ToplevelWatcher:
         """(handle, Toplevel) pairs, most recently used first."""
         return sorted(self.handles.items(), key=lambda item: -item[1].used)
 
+    def focused(self):
+        """The focused app window, or None."""
+        return next((window for window in self.handles.values()
+                     if self.ACTIVATED in window.states), None)
+
     def activate(self, handle):
         if handle in self.handles and self.seat is not None:
             self.send(handle, self.HANDLE_ACTIVATE,
@@ -858,6 +863,53 @@ class AppSwitcher(SheetMenu):
         return bool(windows)
 
 
+def phoc_app_settings(app_id):
+    """Phoc's per-app settings (sm.puri.phoc.application) for an app ID."""
+    # Phoc's path for an app: its ID with every character other than a
+    # letter, digit or "-" made a "-", in lower case.
+    name = re.sub(r"[^0-9A-Za-z-]", "-", app_id).lower()
+    return Gio.Settings.new_with_path(
+        "sm.puri.phoc.application", f"/sm/puri/phoc/application/{name}/")
+
+
+class PanelMenu(SheetMenu):
+    """The panel's own menu (⋯ long press)."""
+
+    def __init__(self, app, toplevels, on_done, on_about):
+        super().__init__(app, on_done)
+        self.toplevels = toplevels
+        self.on_about = on_about
+
+    def refresh(self):
+        self.clear()
+        window = self.toplevels.focused()
+        if window and window.app_id:
+            info = app_info(window.app_id)
+            name = info.get_display_name() if info else window.app_id
+            settings = phoc_app_settings(window.app_id)
+            if settings.get_boolean("scale-to-fit"):
+                self.add_row("tv-symbolic",
+                             f"Stop fitting {name} to the screen",
+                             lambda: self.set_fit(settings, False))
+            else:
+                self.add_row("phone-apple-iphone-symbolic",
+                             f"Fit {name} to the screen",
+                             lambda: self.set_fit(settings, True))
+        self.add_row("help-about-symbolic", f"About {APP_NAME}",
+                     self.on_about)
+        return True
+
+    @staticmethod
+    def set_fit(settings, fit):
+        """Turn phoc's scale-to-fit on for the app (it shrinks a window
+        that's bigger than the screen), or remove the setting again."""
+        if fit:
+            settings.set_boolean("scale-to-fit", True)
+        else:
+            settings.reset("scale-to-fit")
+        Gio.Settings.sync()
+
+
 class AboutScreen(Adw.Window):
     """A full-screen surface that hosts the About dialog, which libadwaita
     shows inside a window (as a bottom sheet on a phone)."""
@@ -979,9 +1031,9 @@ class HomePanel(Gtk.ApplicationWindow):
         self.menu = None
         self.switcher = AppSwitcher(app, self.toplevels,
                                     lambda: self.show_menu(None))
-        self.panel_menu = SheetMenu(app, lambda: self.show_menu(None))
-        self.panel_menu.add_row("help-about-symbolic", f"About {APP_NAME}",
-                                self.show_about)
+        self.panel_menu = PanelMenu(app, self.toplevels,
+                                    lambda: self.show_menu(None),
+                                    self.show_about)
         self.about_open = False
         self.about = AboutScreen(app, lambda: self.show_about(False))
 
@@ -1044,7 +1096,6 @@ class HomePanel(Gtk.ApplicationWindow):
         if self.menu is self.switcher:
             self.show_menu(None)
         elif self.toplevels.windows():
-            self.switcher.refresh()
             self.show_menu(self.switcher)
         else:  # Nothing to switch to; open the overview to start an app.
             self.open_overview()
@@ -1070,6 +1121,7 @@ class HomePanel(Gtk.ApplicationWindow):
     def show_menu(self, menu):
         """Open a menu (closing any other), or None to close it."""
         if menu:
+            menu.refresh()
             # One overlay at a time: the quick-actions row closes.
             self.more.set_active(False)
         self.menu = menu
