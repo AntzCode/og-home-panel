@@ -15,7 +15,7 @@ Status: early development. It runs on Phosh. Plasma Mobile, wlroots shells (Sway
 | Back | Presses the app's own Back button. If there is none, the app goes to the background and the overview opens | Escape |
 | Apps | Opens the app overview, with the keyboard closed | Shows the running apps, like Alt+Tab: tap one to switch to it. The most recently used is nearest the bar. Tap the space above the list, Back or Apps to close it. With no apps running, it opens the app overview instead |
 | Keyboard | Shows or hides the on-screen keyboard | |
-| ⋯ | Shows a row of quick actions: undo, redo, cut, copy, paste, select word, select all | |
+| ⋯ | Shows a row of quick actions: undo, redo, cut, copy, paste, select word, select all | Opens or closes the panel menu (About OG Home Panel). Opening it closes the quick-actions row |
 | Rotate | Appears in place of ⋯ for 4 seconds when you turn the phone while screen rotation is locked. Tap it to rotate the screen to match. In fullscreen, where the bar is hidden, it floats on its own in the bottom-right corner, as you're holding the phone | |
 
 Every button gives a short haptic tick (via feedbackd) as you touch it.
@@ -37,7 +37,7 @@ Wayland has no API that tells you whether an app has back history. og-home-panel
 
 ## Requirements (Phosh)
 
-- Python 3 with PyGObject, GTK 4, libatspi and libfeedback (Lfb) typelibs
+- Python 3 with PyGObject, GTK 4, libadwaita, libatspi and libfeedback (Lfb) typelibs
 - [gtk4-layer-shell](https://github.com/wmww/gtk4-layer-shell)
 - [wtype](https://github.com/atx/wtype)
 

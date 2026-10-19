@@ -13,9 +13,12 @@ gtk4-layer-shell must be loaded before libwayland, so the script re-executes
 itself with the library preloaded.
 
 AT-SPI runs in a helper process (the same script, run with --atspi-helper).
+The panel itself runs in a child process (--panel), which the first process
+restarts if it crashes.
 """
 import os
 import re
+import signal
 import socket
 import struct
 import subprocess
@@ -23,25 +26,79 @@ import sys
 import time
 
 HELPER_FLAG = "--atspi-helper"
+PANEL_FLAG = "--panel"
+RESTART_DELAY_SECONDS = 2
+# More restarts than this within RESTART_WINDOW_SECONDS means it would only
+# crash again (no compositor, say); give up.
+MAX_RESTARTS = 5
+RESTART_WINDOW_SECONDS = 60
+
+
+def supervise():
+    """Run the panel in a child process, and restart it after a crash, so
+    the phone isn't left without its buttons."""
+    child = None
+
+    def stop(signum, _frame):
+        if child:
+            child.send_signal(signum)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    starts = []
+    while True:
+        now = time.monotonic()
+        starts = [t for t in starts if now - t < RESTART_WINDOW_SECONDS]
+        if len(starts) > MAX_RESTARTS:
+            print("panel: keeps crashing, giving up", flush=True)
+            sys.exit(1)
+        starts.append(now)
+        child = subprocess.Popen([sys.executable, *sys.argv, PANEL_FLAG])
+        try:
+            code = child.wait()
+        except KeyboardInterrupt:
+            sys.exit(0)
+        # 0: a clean exit, or a second launch that handed over to the
+        # running panel.
+        if code in (0, -signal.SIGTERM, -signal.SIGINT):
+            sys.exit(0)
+        print(f"panel: exited with {code}, restarting", flush=True)
+        time.sleep(RESTART_DELAY_SECONDS)
+
+
+if HELPER_FLAG not in sys.argv and PANEL_FLAG not in sys.argv:
+    supervise()
+
 LAYER_SHELL_LIB = "/usr/lib/libgtk4-layer-shell.so.0"
 if (HELPER_FLAG not in sys.argv
         and LAYER_SHELL_LIB not in os.environ.get("LD_PRELOAD", "")):
     os.environ["LD_PRELOAD"] = " ".join(
         filter(None, [LAYER_SHELL_LIB, os.environ.get("LD_PRELOAD")]))
     os.execv(sys.executable, [sys.executable, *sys.argv])
+# Loaded now; keep it out of the processes this one starts. Firefox, opened
+# from a link in About, aborted with GTK 4 loaded next to its GTK 3.
+_preload = [lib for lib in os.environ.get("LD_PRELOAD", "").split()
+            if lib != LAYER_SHELL_LIB]
+if _preload:
+    os.environ["LD_PRELOAD"] = " ".join(_preload)
+else:
+    os.environ.pop("LD_PRELOAD", None)
 
 import gi
 
+gi.require_version("Adw", "1")
 gi.require_version("Atspi", "2.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gtk4LayerShell", "1.0")
 gi.require_version("Lfb", "0.0")
-from gi.repository import Atspi, Gdk, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Atspi, Gdk, Gio, GLib, Gtk  # noqa: E402
 from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
 from gi.repository import Lfb, Pango  # noqa: E402
 
 APP_ID = "com.antzcode.og_home_panel"
+APP_NAME = "OG Home Panel"
+REPO_URL = "https://github.com/AntzCode/og-home-panel"
 BAR_HEIGHT = 44
 
 BACK_NAME = re.compile(r"^(go )?back\b", re.IGNORECASE)
@@ -108,12 +165,12 @@ button.nav.floating:active { background: #3a3a3a; }
 button.nav.turn-1 { -gtk-icon-transform: rotate(-90deg); }
 button.nav.turn-2 { -gtk-icon-transform: rotate(180deg); }
 button.nav.turn-3 { -gtk-icon-transform: rotate(90deg); }
-window.og-home-panel.switcher { background: rgba(0, 0, 0, 0.5); }
-.apps { background: #1c1c1c; border-top: 1px solid #333; }
-button.app { min-height: 48px; padding: 4px 16px; border-radius: 0;
+window.og-home-panel.sheet { background: rgba(0, 0, 0, 0.5); }
+.rows { background: #1c1c1c; border-top: 1px solid #333; }
+button.row { min-height: 48px; padding: 4px 16px; border-radius: 0;
              background: none; color: #eee; border: none; box-shadow: none; }
-button.app.current { background: #2a2a2a; }
-button.app:active { background: #3a3a3a; }
+button.row.current { background: #2a2a2a; }
+button.row:active { background: #3a3a3a; }
 """
 
 
@@ -725,23 +782,21 @@ def app_info(app_id):
     return None
 
 
-class AppSwitcher(Gtk.Window):
-    """The running apps, like Alt+Tab: tap one to switch to it.
+class SheetMenu(Gtk.Window):
+    """A list of rows along the bottom of the screen, above the bar.
 
-    Covers the screen above the bar; the most recently used app is nearest
-    the bar, and tapping the dimmed space above the list closes it.
+    The rest of the screen is dimmed, and tapping it closes the menu.
     """
 
-    def __init__(self, app, toplevels, on_done):
+    def __init__(self, app, on_done):
         super().__init__(application=app)
         init_layer_surface(self)
-        self.add_css_class("switcher")
+        self.add_css_class("sheet")
         LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
         LayerShell.set_exclusive_zone(self, -1)
-        self.toplevels = toplevels
         self.on_done = on_done
         self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
-                            css_classes=["apps"])
+                            css_classes=["rows"])
         outside = Gtk.Box(vexpand=True)
         tap = Gtk.GestureClick()
         tap.connect("released", lambda *_args: self.on_done())
@@ -753,38 +808,110 @@ class AppSwitcher(Gtk.Window):
             propagate_natural_height=True))
         self.set_child(box)
 
-    def refresh(self):
-        """Rebuild the list; returns False when no app is running."""
+    def clear(self):
         while child := self.list.get_first_child():
             self.list.remove(child)
+
+    def add_row(self, icon, label, on_pick, current=False):
+        """Add a row; icon is a Gio.Icon or an icon name. Picking it closes
+        the menu, then calls on_pick()."""
+        image = Gtk.Image(pixel_size=32)
+        if isinstance(icon, str):
+            image.set_from_icon_name(icon)
+        else:
+            image.set_from_gicon(icon)
+        row = Gtk.Box(spacing=12)
+        row.append(image)
+        row.append(Gtk.Label(label=label, xalign=0, hexpand=True,
+                             ellipsize=Pango.EllipsizeMode.END))
+        button = Gtk.Button(child=row, css_classes=["row"])
+        if current:
+            button.add_css_class("current")
+        touch = Gtk.GestureClick()
+        touch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        touch.connect("pressed", haptic)
+        button.add_controller(touch)
+        button.connect("clicked", lambda _b: (self.on_done(), on_pick()))
+        self.list.append(button)
+
+
+class AppSwitcher(SheetMenu):
+    """The running apps, like Alt+Tab: tap one to switch to it. The most
+    recently used app is nearest the bar."""
+
+    def __init__(self, app, toplevels, on_done):
+        super().__init__(app, on_done)
+        self.toplevels = toplevels
+
+    def refresh(self):
+        """Rebuild the list; returns False when no app is running."""
+        self.clear()
         windows = self.toplevels.windows()
         for handle, window in reversed(windows):
             info = app_info(window.app_id)
-            icon = Gtk.Image(pixel_size=32)
-            if info and info.get_icon():
-                icon.set_from_gicon(info.get_icon())
-            else:
-                icon.set_from_icon_name("application-x-executable")
-            row = Gtk.Box(spacing=12)
-            row.append(icon)
-            row.append(Gtk.Label(
-                label=window.title or (info and info.get_display_name())
-                or window.app_id, xalign=0, hexpand=True,
-                ellipsize=Pango.EllipsizeMode.END))
-            button = Gtk.Button(child=row, css_classes=["app"])
-            if ToplevelWatcher.ACTIVATED in window.states:
-                button.add_css_class("current")
-            touch = Gtk.GestureClick()
-            touch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-            touch.connect("pressed", haptic)
-            button.add_controller(touch)
-            button.connect("clicked", self.on_pick, handle)
-            self.list.append(button)
+            self.add_row(
+                info and info.get_icon() or "application-x-executable",
+                window.title or (info and info.get_display_name())
+                or window.app_id,
+                lambda h=handle: self.toplevels.activate(h),
+                current=ToplevelWatcher.ACTIVATED in window.states)
         return bool(windows)
 
-    def on_pick(self, _button, handle):
-        self.toplevels.activate(handle)
-        self.on_done()
+
+class AboutScreen(Adw.Window):
+    """A full-screen surface that hosts the About dialog, which libadwaita
+    shows inside a window (as a bottom sheet on a phone)."""
+
+    def __init__(self, app, on_closed):
+        super().__init__(application=app)
+        init_layer_surface(self)
+        LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+        LayerShell.set_exclusive_zone(self, -1)
+        self.set_content(Gtk.Box())
+        self.on_closed = on_closed
+        self.dialog = None
+
+    def present_dialog(self):
+        self.dialog = Adw.AboutDialog(
+            application_name=APP_NAME,
+            application_icon="go-home-symbolic",
+            developer_name="AntzCode",
+            comments="Android-style Back, app switcher and quick actions "
+                     "for Linux phones.",
+            website=REPO_URL,
+            issue_url=REPO_URL + "/issues",
+            copyright="© 2026 AntzCode",
+            # Custom text instead of license_type, whose wording can't be
+            # changed. It's Pango markup; the link opens through on_link.
+            license="This application is free to use, modify and share, "
+                    "but it comes with absolutely no warranty. See the "
+                    "<a href=\"https://www.gnu.org/licenses/gpl-3.0.html\">"
+                    "GNU General Public License, version 3 or later</a> "
+                    "for details.")
+        self.dialog.connect("closed", self.on_dialog_closed)
+        self.dialog.connect("activate-link", self.on_link)
+        self.dialog.present(self)
+
+    def on_link(self, _dialog, uri):
+        # GTK's own handler exports this window's handle for the portal,
+        # and phoc drops the connection with a protocol error, since a layer
+        # surface isn't a toplevel. Open it without a parent window instead,
+        # and close the dialog so it doesn't cover the browser.
+        print("open link:", uri, flush=True)
+        try:
+            Gio.AppInfo.launch_default_for_uri(uri, None)
+        except GLib.Error as error:
+            print("open link failed:", error.message, flush=True)
+        self.close_dialog()
+        return True
+
+    def on_dialog_closed(self, _dialog):
+        self.dialog = None
+        self.on_closed()
+
+    def close_dialog(self):
+        if self.dialog:
+            self.dialog.force_close()
 
 
 class HomePanel(Gtk.ApplicationWindow):
@@ -793,7 +920,7 @@ class HomePanel(Gtk.ApplicationWindow):
         init_layer_surface(self)
 
         self.more = nav_button("view-more-symbolic", self.on_more,
-                               toggle=True)
+                               self.on_more_held, toggle=True)
         # The rotate offer briefly takes the ⋯ button's place.
         self.rotate = nav_button("rotation-allowed-symbolic", self.on_rotate)
         self.more_slot = Gtk.Stack(
@@ -848,9 +975,15 @@ class HomePanel(Gtk.ApplicationWindow):
         self.toplevels = ToplevelWatcher(
             lambda fullscreen: self.hide_for("fullscreen", fullscreen),
             self.on_windows)
-        self.switching = False
+        # The menu (switcher or panel menu) that's open, if any.
+        self.menu = None
         self.switcher = AppSwitcher(app, self.toplevels,
-                                    lambda: self.show_switcher(False))
+                                    lambda: self.show_menu(None))
+        self.panel_menu = SheetMenu(app, lambda: self.show_menu(None))
+        self.panel_menu.add_row("help-about-symbolic", f"About {APP_NAME}",
+                                self.show_about)
+        self.about_open = False
+        self.about = AboutScreen(app, lambda: self.show_about(False))
 
         self.rotation = RotationWatcher(self.offer_rotation)
         # The lock screen is also on the overlay layer; keep off it.
@@ -869,7 +1002,10 @@ class HomePanel(Gtk.ApplicationWindow):
         height = self.bar.measure(Gtk.Orientation.VERTICAL, -1)[1]
         LayerShell.set_exclusive_zone(self, height)
         LayerShell.set_margin(self.actions, LayerShell.Edge.BOTTOM, height)
-        LayerShell.set_margin(self.switcher, LayerShell.Edge.BOTTOM, height)
+        # The About screen too: the bar would cover the bottom of its
+        # dialog, as it sits above it in the overlay layer.
+        for surface in (self.switcher, self.panel_menu, self.about):
+            LayerShell.set_margin(surface, LayerShell.Edge.BOTTOM, height)
         print("exclusive zone:", height, flush=True)
 
     def hide_for(self, reason, hidden):
@@ -886,27 +1022,30 @@ class HomePanel(Gtk.ApplicationWindow):
     def update_visibility(self):
         self.set_visible(not self.hidden_by)
         self.actions.set_visible(not self.hidden_by and self.more.get_active())
-        self.switcher.set_visible(not self.hidden_by and self.switching)
+        for menu in (self.switcher, self.panel_menu):
+            menu.set_visible(not self.hidden_by and self.menu is menu)
+        self.about.set_visible(not self.hidden_by and self.about_open)
         self.rotate_float.set_visible(self.offered is not None
                                       and self.hidden_by == {"fullscreen"})
 
     def on_back(self, _button):
-        if self.switching:
-            self.show_switcher(False)
+        if self.menu:
+            self.show_menu(None)
             return
         self.atspi.send(f"back {time.monotonic()}")
 
     def on_apps(self, _button):
-        if self.switching:
-            self.show_switcher(False)
+        if self.menu:
+            self.show_menu(None)
         else:
             self.open_overview()
 
     def on_apps_held(self):
-        if self.switching:
-            self.show_switcher(False)
+        if self.menu is self.switcher:
+            self.show_menu(None)
         elif self.toplevels.windows():
-            self.show_switcher(True)
+            self.switcher.refresh()
+            self.show_menu(self.switcher)
         else:  # Nothing to switch to; open the overview to start an app.
             self.open_overview()
 
@@ -918,20 +1057,35 @@ class HomePanel(Gtk.ApplicationWindow):
 
     def on_more(self, _button):
         if self.more.get_active():
-            self.switching = False
+            self.menu = None
         self.update_visibility()
 
-    def show_switcher(self, show):
-        if show:
-            self.switcher.refresh()
+    def on_more_held(self):
+        """Toggle the panel menu. Opening it closes the quick-actions row."""
+        if self.menu is self.panel_menu:
+            self.show_menu(None)
+        else:
+            self.show_menu(self.panel_menu)
+
+    def show_menu(self, menu):
+        """Open a menu (closing any other), or None to close it."""
+        if menu:
             # One overlay at a time: the quick-actions row closes.
             self.more.set_active(False)
-        self.switching = show
+        self.menu = menu
         self.update_visibility()
 
+    def show_about(self, show=True):
+        self.about_open = show
+        self.update_visibility()
+        if show:
+            self.about.present_dialog()
+        else:
+            self.about.close_dialog()
+
     def on_windows(self):
-        if self.switching and not self.switcher.refresh():
-            self.show_switcher(False)
+        if self.menu is self.switcher and not self.switcher.refresh():
+            self.show_menu(None)
 
     def offer_rotation(self, transform):
         """Show the rotate button for a few seconds, or None to take it
@@ -999,7 +1153,8 @@ def main():
     if HELPER_FLAG in sys.argv:
         helper_main()
         return
-    app = Gtk.Application(application_id=APP_ID)
+    # Adw.Application loads libadwaita's styles, for the About dialog.
+    app = Adw.Application(application_id=APP_ID)
     Lfb.init(app.get_application_id())
 
     def activate(app):
